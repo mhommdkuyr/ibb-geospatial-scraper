@@ -6,18 +6,29 @@ on:
       scope:
         description: 'Scraping Scope (city = Ibb City & Corridors, full = Entire Governorate)'
         required: true
-        default: 'city'
+        default: 'full'
         type: choice
         options:
           - city
           - full
       max_cells_per_shard:
-        description: 'Max micro-cells to process per shard per run (0 = all, default = 2 for fast batch)'
+        description: 'Max micro-cells to process per shard per run (0 = Unlimited Full Sweep)'
         required: false
-        default: '2'
+        default: '0'
+        type: string
+      max_runtime_minutes:
+        description: 'Graceful time budget per run in minutes before auto-checkpointing'
+        required: false
+        default: '45'
         type: string
   schedule:
+    # Automated recurring sweep every 6 hours + weekly full consolidation
+    - cron: '0 */6 * * *'
     - cron: '0 0 * * 0'
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   generate_micro_grid:
@@ -35,9 +46,9 @@ jobs:
       - name: Install Grid Dependencies
         run: pip install -r requirements.txt
 
-      - name: Generate Adaptive Shards
+      - name: Generate Adaptive Shards (8 Parallel Matrix Shards)
         run: |
-          python grid_generator.py --scope ${{ inputs.scope || 'city' }} --shards 4 --shards-dir shards
+          python grid_generator.py --scope ${{ inputs.scope || 'full' }} --shards 8 --shards-dir shards
 
       - name: Upload Grid Shards Artifact
         uses: actions/upload-artifact@v4
@@ -46,7 +57,7 @@ jobs:
           path: |
             shards/
             ibb_grid.geojson
-          retention-days: 5
+          retention-days: 7
 
   scrape_shard:
     name: Parallel Scrape Shard ${{ matrix.shard }}
@@ -55,9 +66,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
-      - name: Checkout Code
+      - name: Checkout Code (including persistent checkpoint.json)
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -76,20 +87,25 @@ jobs:
         with:
           name: grid-shards
 
-      - name: Execute Shard Pipeline
+      - name: Execute Shard Pipeline (Unlimited Mode with Checkpoint Resume)
         env:
           GOOGLE_SOCS_COOKIE: "CAESHAgBEhJnd3NfMjAyNDA5MTAtMF9SQzEaAmFyIAEaBgiA_K-1Bg"
           SHARD_NUM: ${{ matrix.shard }}
         run: |
           SHARD_FILE="shards/grid_shard_0${{ matrix.shard }}.json"
-          echo "Processing shard file: $SHARD_FILE"
+          echo "Processing shard file: $SHARD_FILE (max_cells=${{ inputs.max_cells_per_shard || '0' }})"
+          if [ -f "ibb_master_places.db" ]; then
+            cp ibb_master_places.db ibb_places.db
+          fi
+
           python pipeline_orchestrator.py \
             --shard-file "$SHARD_FILE" \
-            --max-cells ${{ inputs.max_cells_per_shard || '2' }} \
+            --max-cells ${{ inputs.max_cells_per_shard || '0' }} \
+            --max-runtime-minutes ${{ inputs.max_runtime_minutes || '45' }} \
             --headless
 
           mv ibb_places.db "ibb_places_shard_${{ matrix.shard }}.db" || true
-          mv checkpoint.json "checkpoint_shard_${{ matrix.shard }}.json" || true
+          cp checkpoint.json "checkpoint_shard_${{ matrix.shard }}.json" || true
 
       - name: Upload Shard Results
         uses: actions/upload-artifact@v4
@@ -101,12 +117,14 @@ jobs:
           retention-days: 7
 
   merge_and_consolidate:
-    name: Deduplicate, Merge & Publish Master Dataset
+    name: Deduplicate, Merge & Auto-Commit Checkpoint
     needs: scrape_shard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -121,11 +139,18 @@ jobs:
         with:
           path: all_shards/
 
-      - name: Run Master Deduplication & Spatial Merger
+      - name: Run Master Deduplication & Checkpoint Consolidation
         run: |
           python merge_shards.py
 
-      - name: Upload Final Consolidated Dataset
+      - name: Auto-Commit Updated Checkpoint & Master Outputs to Repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add checkpoint.json ibb_master_places.geojson ibb_master_places.csv ibb_master_places.db || true
+          git diff --staged --quiet || (git commit -m "chore(scraper): auto-update checkpoint.json and master dataset [skip ci]" && git pull --rebase origin main && git push origin main)
+
+      - name: Upload Final Consolidated Dataset Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ibb_geospatial_master_dataset
@@ -133,4 +158,5 @@ jobs:
             ibb_master_places.db
             ibb_master_places.geojson
             ibb_master_places.csv
+            checkpoint.json
           retention-days: 30

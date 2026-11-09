@@ -1,11 +1,19 @@
 """
 Unified Pipeline Orchestrator for Ibb Geospatial Scraping.
+
+Coordinates the 3-Tier Hybrid Architecture:
+- Tier 1: gosom/google-maps-scraper (Fast grid sweep in Go/Docker)
+- Tier 2: Playwright Network Interceptor (Zoom 21 micro-panning for 1m-adjacent shops & multi-story buildings)
+- Tier 3: omkarcloud/google-maps-scraper (Botasaurus deep enrichment for place_id metadata & reviews)
+- OSM Enrichment & Spatial Join
+- SQLite / GeoJSON Deduplication and Checkpoint Management with Graceful Time-Budgeting
 """
 
 import asyncio
 import subprocess
 import json
 import os
+import time
 import argparse
 from typing import List, Dict, Any
 
@@ -24,14 +32,21 @@ class UnifiedIbbScraperPipeline:
         db_path: str = "ibb_places.db",
         checkpoint_path: str = "checkpoint.json",
         headless: bool = True,
-        max_cells: int = 0
+        max_cells: int = 0,
+        max_runtime_minutes: float = 300.0
     ):
         self.shard_file = shard_file
         self.db = DedupEngine(db_path, checkpoint_path)
         self.osm = OSMSpatialEnricher()
         self.headless = headless
         self.max_cells = max_cells
+        self.max_runtime_seconds = max_runtime_minutes * 60.0
+        self.start_time = time.time()
         self.interceptor = MicroPanningNetworkInterceptor(headless=self.headless)
+
+    def is_time_budget_exceeded(self) -> bool:
+        elapsed = time.time() - self.start_time
+        return elapsed >= self.max_runtime_seconds
 
     def prepare_environment(self):
         print("[Pipeline] Step 0: Initializing OSM spatial data for Ibb...")
@@ -43,29 +58,33 @@ class UnifiedIbbScraperPipeline:
             with open(self.shard_file, "r", encoding="utf-8") as f:
                 cells = json.load(f)
         else:
-            print("[Pipeline] Generating fresh adaptive grid cells for Ibb City...")
+            print("[Pipeline] Generating fresh adaptive grid cells for Ibb Governorate & City...")
             gen = AdaptiveGridGenerator()
-            cells = gen.generate_full_adaptive_grid(include_rural=False)
+            cells = gen.generate_full_adaptive_grid(include_rural=True)
+
+        pending_cells = [c for c in cells if not self.db.checkpoint.is_cell_completed(c["cell_id"])]
+        print(f"[Pipeline] Total shard cells: {len(cells)} | Already completed: {len(cells) - len(pending_cells)} | Pending: {len(pending_cells)}")
 
         if self.max_cells and self.max_cells > 0:
-            print(f"[Pipeline] Limiting batch execution to {self.max_cells} priority cells for this run.")
-            return cells[:self.max_cells]
-        return cells
+            print(f"[Pipeline] Limiting batch execution to {self.max_cells} pending priority cells for this run.")
+            return pending_cells[:self.max_cells]
+        print(f"[Pipeline] UNLIMITED FULL SWEEP MODE (max_cells=0): Processing all {len(pending_cells)} pending cells within time budget ({self.max_runtime_seconds/60:.1f} min).")
+        return pending_cells
 
     def run_tier1_gosom_sweep(self, cells: List[Dict[str, Any]], keywords: List[str]):
         gosom_input_file = "gosom_queries.txt"
         gosom_output_file = "gosom_results.json"
 
         queries = []
-        for cell in cells:
-            if cell.get("tier") == "tier1_gosom_grid":
-                c_lat = cell["center_lat"]
-                c_lng = cell["center_lng"]
-                for kw in keywords[:3]:
-                    queries.append(f"{kw} near {c_lat},{c_lng}")
+        tier1_cells = [c for c in cells if c.get("tier") == "tier1_gosom_grid"]
+        for cell in tier1_cells[:150]:
+            c_lat = cell["center_lat"]
+            c_lng = cell["center_lng"]
+            for kw in keywords[:3]:
+                queries.append(f"{kw} near {c_lat},{c_lng}")
 
         if not queries:
-            print("[Tier 1 - Gosom] No tier1 cells in this batch slice.")
+            print("[Tier 1 - Gosom] No tier1 cells in current slice (prioritizing ultra-dense corridors first).")
             return
 
         with open(gosom_input_file, "w", encoding="utf-8") as f:
@@ -88,7 +107,7 @@ class UnifiedIbbScraperPipeline:
 
         print(f"[Tier 1 - Gosom] Executing: {' '.join(cmd)}")
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             print(f"[Tier 1 - Gosom] Exit code: {res.returncode}")
         except Exception as e:
             print(f"[Tier 1 - Gosom] Notice: Gosom Docker execution finished or skipped: {e}")
@@ -118,39 +137,7 @@ class UnifiedIbbScraperPipeline:
                 print(f"[Tier 1 - Gosom] Error parsing output: {e}")
 
     async def run_tier2_playwright_dense_panning(self, cells: List[Dict[str, Any]]):
-        dense_cells = [c for c in cells if c.get("tier") == "tier3_panning_dense"]
-        print(f"[Tier 2 - Playwright Sniffer] Found {len(dense_cells)} ultra-dense corridor cells in batch.")
-
-        priority_kws = get_priority_seeds()
-
-        for idx, cell in enumerate(dense_cells):
-            cell_id = cell["cell_id"]
-            if self.db.checkpoint.is_cell_completed(cell_id):
-                print(f"  [Skip] Cell {cell_id} already marked completed in checkpoint.")
-                continue
-
-            kw = priority_kws[idx % len(priority_kws)]
-            print(f"\n[Tier 2 - Playwright Sniffer] Processing ({idx+1}/{len(dense_cells)}): {cell['zone_name']} (Seed: {kw})")
-
-            captured = await self.interceptor.scan_corridor_with_panning(
-                start_lat=cell["min_lat"],
-                start_lng=cell["min_lng"],
-                end_lat=cell["max_lat"],
-                end_lng=cell["max_lng"],
-                keyword=kw,
-                zoom=cell.get("zoom", 21),
-                step_deg=0.00035
-            )
-
-            print(f"  [Sniffer Results] Cell {cell_id} intercepted {len(captured)} raw entities.")
-            for place in captured:
-                place["corridor_key"] = cell.get("corridor_key")
-                enriched = self.osm.enrich_place_address(place)
-                self.db.upsert_place(enriched)
-
-            self.db.checkpoint.mark_cell_completed(cell_id)
-
-        print("[OSM Spatial Ingestion] Syncing OSM buildings, shops, and landmarks into master database...")
+        print("[OSM Spatial Ingestion] Syncing OSM buildings, shops, and landmarks into database...")
         osm_count = 0
         for idx, bldg in enumerate(self.osm.buildings):
             if bldg.get("has_name") and bldg.get("center_lat") and bldg.get("center_lng"):
@@ -182,16 +169,55 @@ class UnifiedIbbScraperPipeline:
                 osm_count += 1
         print(f"[OSM Spatial Ingestion] Indexed and enriched {osm_count} OSM entities.")
 
+        dense_cells = [c for c in cells if c.get("tier") == "tier3_panning_dense"]
+        print(f"[Tier 2 - Playwright Sniffer] Found {len(dense_cells)} pending ultra-dense corridor cells in shard.")
+
+        all_kws = get_all_seeds()
+
+        for idx, cell in enumerate(dense_cells):
+            if self.is_time_budget_exceeded():
+                print(f"\n[Time Budget Reached] Gracefully stopping after {idx} cells to commit checkpoint & DB.")
+                break
+
+            cell_id = cell["cell_id"]
+            if self.db.checkpoint.is_cell_completed(cell_id):
+                continue
+
+            kw = all_kws[idx % len(all_kws)]
+            elapsed_m = (time.time() - self.start_time) / 60.0
+            print(f"\n[Tier 2 - Playwright Sniffer] [{elapsed_m:.1f}m] Processing ({idx+1}/{len(dense_cells)}): {cell['zone_name']} | Cell: {cell_id} | Seed: {kw}")
+
+            try:
+                captured = await self.interceptor.scan_corridor_with_panning(
+                    start_lat=cell["min_lat"],
+                    start_lng=cell["min_lng"],
+                    end_lat=cell["max_lat"],
+                    end_lng=cell["max_lng"],
+                    keyword=kw,
+                    zoom=cell.get("zoom", 21),
+                    step_deg=0.00035
+                )
+
+                print(f"  [Sniffer Results] Cell {cell_id} intercepted {len(captured)} raw entities.")
+                for place in captured:
+                    place["corridor_key"] = cell.get("corridor_key")
+                    enriched = self.osm.enrich_place_address(place)
+                    self.db.upsert_place(enriched)
+
+                self.db.checkpoint.mark_cell_completed(cell_id)
+            except Exception as e:
+                print(f"  [Sniffer Error] Cell {cell_id} encountered error: {e}")
+
     def run_tier3_deep_enrichment(self):
         cursor = self.db.conn.cursor()
         cursor.execute("""
             SELECT place_id, title, lat, lng
             FROM places
             WHERE (phone IS NULL OR opening_hours IS NULL) AND place_id NOT LIKE 'synth_%'
-            LIMIT 50
+            LIMIT 100
         """)
         candidates = cursor.fetchall()
-        print(f"\n[Tier 3 - Deep Botasaurus Enrichment] Found {len(candidates)} candidates for deep inspection.")
+        print(f"\n[Tier 3 - Deep Botasaurus Enrichment] Found {len(candidates)} candidates queued for deep inspection.")
 
     def execute_full_pipeline(self):
         self.prepare_environment()
@@ -213,11 +239,13 @@ if __name__ == "__main__":
     parser.add_argument("--shard-file", type=str, default="", help="Path to grid shard JSON file")
     parser.add_argument("--headless", action="store_true", default=True, help="Run browsers headlessly")
     parser.add_argument("--max-cells", type=int, default=0, help="Limit number of cells per run (0 = unlimited)")
+    parser.add_argument("--max-runtime-minutes", type=float, default=300.0, help="Graceful stop time budget in minutes")
     args = parser.parse_args()
 
     pipeline = UnifiedIbbScraperPipeline(
         shard_file=args.shard_file,
         headless=args.headless,
-        max_cells=args.max_cells
+        max_cells=args.max_cells,
+        max_runtime_minutes=args.max_runtime_minutes
     )
     pipeline.execute_full_pipeline()
