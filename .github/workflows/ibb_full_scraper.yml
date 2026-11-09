@@ -1,0 +1,136 @@
+name: Ibb Governorate & City High-Density Geospatial Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Scraping Scope (city = Ibb City & Corridors, full = Entire Governorate)'
+        required: true
+        default: 'city'
+        type: choice
+        options:
+          - city
+          - full
+      max_cells_per_shard:
+        description: 'Max micro-cells to process per shard per run (0 = all, default = 2 for fast batch)'
+        required: false
+        default: '2'
+        type: string
+  schedule:
+    - cron: '0 0 * * 0'
+
+jobs:
+  generate_micro_grid:
+    name: Generate Adaptive Micro-Grid & Shards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Grid Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate Adaptive Shards
+        run: |
+          python grid_generator.py --scope ${{ inputs.scope || 'city' }} --shards 4 --shards-dir shards
+
+      - name: Upload Grid Shards Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grid-shards
+          path: |
+            shards/
+            ibb_grid.geojson
+          retention-days: 5
+
+  scrape_shard:
+    name: Parallel Scrape Shard ${{ matrix.shard }}
+    needs: generate_micro_grid
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Dependencies & Playwright
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Download Grid Shards Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grid-shards
+
+      - name: Execute Shard Pipeline
+        env:
+          GOOGLE_SOCS_COOKIE: "CAESHAgBEhJnd3NfMjAyNDA5MTAtMF9SQzEaAmFyIAEaBgiA_K-1Bg"
+          SHARD_NUM: ${{ matrix.shard }}
+        run: |
+          SHARD_FILE="shards/grid_shard_0${{ matrix.shard }}.json"
+          echo "Processing shard file: $SHARD_FILE"
+          python pipeline_orchestrator.py \
+            --shard-file "$SHARD_FILE" \
+            --max-cells ${{ inputs.max_cells_per_shard || '2' }} \
+            --headless
+
+          mv ibb_places.db "ibb_places_shard_${{ matrix.shard }}.db" || true
+          mv checkpoint.json "checkpoint_shard_${{ matrix.shard }}.json" || true
+
+      - name: Upload Shard Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-db-${{ matrix.shard }}
+          path: |
+            ibb_places_shard_${{ matrix.shard }}.db
+            checkpoint_shard_${{ matrix.shard }}.json
+          retention-days: 7
+
+  merge_and_consolidate:
+    name: Deduplicate, Merge & Publish Master Dataset
+    needs: scrape_shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download All Shard Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_shards/
+
+      - name: Run Master Deduplication & Spatial Merger
+        run: |
+          python merge_shards.py
+
+      - name: Upload Final Consolidated Dataset
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibb_geospatial_master_dataset
+          path: |
+            ibb_master_places.db
+            ibb_master_places.geojson
+            ibb_master_places.csv
+          retention-days: 30

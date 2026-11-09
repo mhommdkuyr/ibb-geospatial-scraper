@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  gosom_grid_sweeper:
+    image: gosom/google-maps-scraper:latest
+    container_name: ibb_gosom_sweeper
+    volumes:
+      - ./data:/data
+    command: >
+      -input /data/gosom_queries.txt
+      -results /data/gosom_results.json
+      -c 8
+      -depth 1
+      -lang ar
+      -exit-on-empty
+    restart: "no"
+
+  ibb_orchestrator:
+    build: .
+    container_name: ibb_unified_pipeline
+    volumes:
+      - ./data:/app/data
+      - ./checkpoints:/app/checkpoints
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GOOGLE_SOCS_COOKIE=CAESHAgBEhJnd3NfMjAyNDA5MTAtMF9SQzEaAmFyIAEaBgiA_K-1Bg
+    depends_on:
+      - gosom_grid_sweeper
+    command: python pipeline_orchestrator.py --headless
