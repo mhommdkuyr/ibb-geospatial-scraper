@@ -121,19 +121,23 @@ class UnifiedIbbScraperPipeline:
         dense_cells = [c for c in cells if c.get("tier") == "tier3_panning_dense"]
         print(f"[Tier 2 - Playwright Sniffer] Found {len(dense_cells)} ultra-dense corridor cells in batch.")
 
+        priority_kws = get_priority_seeds()
+
         for idx, cell in enumerate(dense_cells):
             cell_id = cell["cell_id"]
             if self.db.checkpoint.is_cell_completed(cell_id):
                 print(f"  [Skip] Cell {cell_id} already marked completed in checkpoint.")
                 continue
 
-            print(f"\n[Tier 2 - Playwright Sniffer] Processing ({idx+1}/{len(dense_cells)}): {cell['zone_name']}")
+            kw = priority_kws[idx % len(priority_kws)]
+            print(f"\n[Tier 2 - Playwright Sniffer] Processing ({idx+1}/{len(dense_cells)}): {cell['zone_name']} (Seed: {kw})")
 
             captured = await self.interceptor.scan_corridor_with_panning(
                 start_lat=cell["min_lat"],
                 start_lng=cell["min_lng"],
                 end_lat=cell["max_lat"],
                 end_lng=cell["max_lng"],
+                keyword=kw,
                 zoom=cell.get("zoom", 21),
                 step_deg=0.00035
             )
@@ -146,22 +150,37 @@ class UnifiedIbbScraperPipeline:
 
             self.db.checkpoint.mark_cell_completed(cell_id)
 
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT COUNT(*) as cnt FROM places")
-        row = cursor.fetchone()
-        if row and row["cnt"] == 0 and self.osm.neighborhoods:
-            print("[Tier 2 - Fallback] Enriching baseline OSM POIs & amenities for Ibb City...")
-            for idx, item in enumerate(self.osm.neighborhoods[:30]):
+        print("[OSM Spatial Ingestion] Syncing OSM buildings, shops, and landmarks into master database...")
+        osm_count = 0
+        for idx, bldg in enumerate(self.osm.buildings):
+            if bldg.get("has_name") and bldg.get("center_lat") and bldg.get("center_lng"):
                 poi = {
-                    "place_id": f"osm_ibb_node_{idx}",
-                    "title": item["name"],
-                    "category": item.get("type", "معلم / منشأة"),
-                    "lat": item["lat"],
-                    "lng": item["lng"],
-                    "source_tier": "osm_verified_baseline"
+                    "place_id": f"osm_bldg_{idx}_{bldg['center_lat']:.5f}",
+                    "title": bldg["name"],
+                    "category": bldg.get("category", "معلم / مبنى تجاري"),
+                    "lat": bldg["center_lat"],
+                    "lng": bldg["center_lng"],
+                    "source_tier": "osm_overpass_building"
                 }
                 enriched = self.osm.enrich_place_address(poi)
                 self.db.upsert_place(enriched)
+                osm_count += 1
+
+        for idx, item in enumerate(self.osm.neighborhoods):
+            if item.get("lat") and item.get("lng") and item.get("name"):
+                poi = {
+                    "place_id": f"osm_node_{item.get('id', idx)}_{item['lat']:.5f}",
+                    "title": item["name"],
+                    "category": item.get("type", "منشأة / معلم"),
+                    "phone": item.get("phone"),
+                    "lat": item["lat"],
+                    "lng": item["lng"],
+                    "source_tier": "osm_overpass_poi"
+                }
+                enriched = self.osm.enrich_place_address(poi)
+                self.db.upsert_place(enriched)
+                osm_count += 1
+        print(f"[OSM Spatial Ingestion] Indexed and enriched {osm_count} OSM entities.")
 
     def run_tier3_deep_enrichment(self):
         cursor = self.db.conn.cursor()
