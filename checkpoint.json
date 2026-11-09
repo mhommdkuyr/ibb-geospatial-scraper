@@ -1,9 +1,44 @@
 {
-  "completed_cells": [],
+  "completed_cells": [
+    "dense_shari_taiz_00001",
+    "dense_shari_taiz_00002",
+    "dense_shari_taiz_00003",
+    "dense_shari_taiz_00004",
+    "dense_shari_taiz_00006",
+    "dense_shari_taiz_00007",
+    "dense_shari_taiz_00009",
+    "dense_shari_taiz_00010",
+    "dense_shari_taiz_00011",
+    "dense_shari_taiz_00012",
+    "dense_shari_taiz_00014",
+    "dense_shari_taiz_00015",
+    "dense_shari_taiz_00017",
+    "dense_shari_taiz_00018",
+    "dense_shari_taiz_00019",
+    "dense_shari_taiz_00020",
+    "dense_shari_taiz_00022",
+    "dense_shari_taiz_00023",
+    "dense_shari_taiz_00025",
+    "dense_shari_taiz_00026",
+    "dense_shari_taiz_00027",
+    "dense_shari_taiz_00028",
+    "dense_shari_taiz_00030",
+    "dense_shari_taiz_00031",
+    "dense_shari_taiz_00033",
+    "dense_shari_taiz_00034",
+    "dense_shari_taiz_00035",
+    "dense_shari_taiz_00036",
+    "dense_shari_taiz_00038",
+    "dense_shari_taiz_00039",
+    "dense_shari_taiz_00042",
+    "dense_shari_taiz_00043",
+    "dense_shari_taiz_00044",
+    "dense_shari_taiz_00047"
+  ],
   "completed_keywords": [],
   "stats": {
-    "inserted": 0,
-    "merged": 0,
-    "total_seen": 0
+    "inserted": 471,
+    "merged": 2236,
+    "total_seen": 2707
   }
 }
